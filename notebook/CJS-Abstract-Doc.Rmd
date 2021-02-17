@@ -1,0 +1,681 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r setup}
+# load libraries and data set
+library(dplyr)
+library(ggplot2)
+library(ggalluvial)
+
+# WARNING: THESE DATA FILES ARE NOT INCLUDED IN THIS REPO.
+#          IF YOU NEED ACCSESS TO THE ORIGINAL DATA PLEASE GET
+#          IN TOUCH WITH THE AUTHORS.
+# commentThreads <- readRDS("../data/2019-10-25/commentThreads.rds")
+# search <- readRDS("../data/2019-10-25/search.rds")
+# comments <- readRDS("../data/comments.rds")
+# search2 <- fst::read.fst("~/20-02-06.fst") %>% as_tibble()
+
+candidates <- readr::read_csv("../candidates.csv")
+channels_coded_v3 <- readr::read_csv("../data/channels-coded-v3.csv")
+
+```
+
+# Wrangle some data!
+
+```{r step-1}
+# unnest commentThreads to a pool of comments
+# comments <- commentThreads %>%
+#   mutate(commentThreads = purrr::map(commentThreads, ~select_if(.tbl = .x, ~!is.data.frame(.), ~.))) %>%
+#   tidyr::unnest(commentThreads)
+```
+
+```{r step-2}
+# reconstruct scraping date and query term from filename
+comments <- comments %>%
+  mutate(
+    scrapedAt = stringr::str_extract(file, "(?<=-)(\\d|-|T)+(?=\\.rds)") %>%
+      stringr::str_replace("-(?=\\d{2}$)", ":") %>%
+      as.POSIXct(format = "%FT%H:%M"),
+    scrapedAt = if_else(
+      is.na(scrapedAt),
+      stringr::str_extract(file, "(?<=-)(\\d|-|T)+(?=\\.rds)") %>%
+        as.POSIXct(format = "%F"),
+      scrapedAt
+    )
+  )
+
+# extract source term
+comments <- comments %>% 
+  mutate(
+    source.term = stringr::str_extract(
+      file,
+      "(?<=-)\\w+\\s\\w+(?=-)"
+    )
+  )
+```
+
+```{r step-three}
+channels <- search %>% 
+  distinct(id.videoId, snippet.channelId, snippet.channelTitle)
+
+comments <- comments %>% 
+  left_join(
+    channels,
+    by = "id.videoId"
+  )
+
+comments <- comments %>% 
+  left_join(
+    candidates,
+    by = c("source.term" = "name")
+  )
+
+channels_coded <- readr::read_csv2(
+      file = "../channels-coded-v1.csv",
+    ) %>% 
+    transmute(
+      name,
+      type
+    )
+
+comments <- comments %>% 
+  left_join(
+    channels_coded,
+    by = c("snippet.channelTitle.x" = "name")
+  )
+
+# all publishedAt's into DateTimes
+comments <- comments %>% 
+  mutate_at(
+    vars(
+      ends_with("at")
+    ),
+    as.POSIXct
+  ) %>% 
+  mutate_at(
+    vars(ends_with("Count")),
+    as.double
+  )
+```
+
+```{r step-four}
+replies <- comments %>%
+  filter(purrr::map_lgl(replies, ~!is.null(.))) %>% 
+  transmute(
+    scrapedAt,
+    source.term,
+    snippet.topLevelComment.id,
+    replies = purrr::map(
+      replies,
+      ~mutate(.x, running = 1:nrow(.x))
+    )
+  ) %>% 
+  tidyr::unnest(replies)
+    
+```
+
+# Analyze some more data!
+
+```{r}
+comments %>%
+  group_by(
+    source.term,
+    snippet.channelTitle
+  ) %>%
+  distinct(snippet.topLevelComment.id, .keep_all = T) %>%
+  summarise(
+    count = n()
+  ) %>% 
+  head(10)
+
+```
+
+```{r}
+maps <- comments %>% 
+  select(
+    id.videoId,
+    source.term,
+    scrapedAt,
+    snippet.channelTitle,
+    snippet.topLevelComment.snippet.likeCount,
+    snippet.topLevelComment.id,
+    running
+  ) %>% 
+  tidyr::nest(data = c(scrapedAt, snippet.topLevelComment.snippet.likeCount, snippet.topLevelComment.id, running))
+
+plot_in_parallel <- function(df) {
+  require(furrr)
+  plan(multiprocess)
+  
+  mutate(
+    df,
+    plot = future_map(
+      data,
+      ~transmute(
+          .x,
+          scrapedAt,
+          running = as.factor(running),
+          likeCount = snippet.topLevelComment.snippet.likeCount,
+          id = snippet.topLevelComment.id
+          # scrapedAt = as.factor(format(scrapedAt, format = "%D %H:%M"))
+        ) %>%
+        ggplot(
+          aes(
+            x = scrapedAt,
+            y = likeCount,
+            stratum = running,
+            alluvium = id,
+            fill = id
+          )
+        ) +
+        geom_alluvium(
+          show.legend = F
+        ) +
+      #   geom_stratum(
+      #     show.legend = F,
+      #     alpha = 0.2
+      #   )
+        scale_fill_viridis_d() +
+        theme_minimal()
+    )
+  )
+}
+
+save_plots_parrallel <- function(df, path, plots = plot, ...) {
+  require(furrr)
+  require(magrittr)
+  
+  plan(multiprocess)
+  dir.create(path, recursive = T)
+  
+  plots <- enquo(plots)
+  dots <- quo(...)
+  
+  filenames <- rlang::eval_tidy(dots, df)
+  
+  df %>% 
+    ungroup %>% 
+    mutate(
+      filename = paste(filenames, sep = "-"),
+      future_map2(
+        !! plots,
+        filename,
+        ~ggsave(
+          paste0(path, .y, ".png"),
+          .x
+        ) %T>% {
+          print(.y)
+        }
+      )
+    )
+}
+
+maps <- maps %>% 
+  plot_in_parallel()
+
+maps %>%
+  save_plots_parrallel("../plots/comment-ranking/")
+```
+
+```{r}
+cummulative_view_count_plot <- search %>%
+  ungroup %>%
+  left_join(
+    channels_coded_v3,
+    by = c("snippet.channelTitle" = "channel")
+  ) %>%
+  left_join(
+    candidates,
+    by = c("source.term" = "name")
+  ) %>%
+  mutate(
+    source.term = as.factor(paste0(source.term, ", ", party)),
+    type = if_else(
+      is.na(type) |
+      (
+        type != "party" &
+        type != "news"
+      ),
+      "other",
+      type
+    ),
+    type = factor(type, levels = c("party", "news", "other"))
+  ) %>%
+  # filter(type != "other") %>% 
+  filter(statistics.viewCount <= 3e6) %>%
+  group_by(source.term, type, id.videoId) %>%
+  summarise(
+    statistics.viewCount = mean(statistics.viewCount)
+  ) %>% 
+  # arrange(-desc(scrapedAt)) %>% 
+  # distinct(id.videoId, .keep_all = T) %>%
+  group_by(source.term, type) %>% 
+  summarise(statistics.viewCount = sum(statistics.viewCount)) %>% 
+  ungroup() %>%
+  mutate(source.term = forcats::fct_reorder(source.term, statistics.viewCount, .desc = T, .fun = sum)) %>%
+  ggplot(aes(source.term, statistics.viewCount, fill = type)) +
+  geom_bar(
+    stat = "identity",
+    alpha = 0.75
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    x = "",
+    y = "view count",
+    fill = ""
+  ) +
+  scale_fill_manual(
+      values = c(
+        "party" = "orangered1",
+        "news" = "lightskyblue1",
+        "other" = "grey90"
+      )
+  ) +
+  # scale_fill_manual(values = c("other" = "grey", "news" = "burlywood3", "party" = "darkseagreen3")) +
+  scale_y_continuous(
+    minor_breaks = 1:15 * 1e6,
+    breaks = 0:3 * 5e6,
+    labels = scales::number_format(big.mark = ",")
+  )
+
+ggsave(
+  "../plots/view-count.png",
+  plot = cummulative_view_count_plot,
+  width = 5.5,
+  height = 4,
+)
+
+cummulative_view_count_plot
+```
+
+```{r}
+cummulative_like_count_plot <- search %>%
+  ungroup %>% 
+  left_join(
+    channels_coded_v3,
+    by = c("snippet.channelTitle" = "channel")
+  ) %>% 
+  left_join(
+    candidates,
+    by = c("source.term" = "name")
+  ) %>% 
+  mutate(
+    source.term = as.factor(paste0(source.term, ", ", party)),
+    type = if_else(
+      is.na(type) |
+      (
+        type != "party" &
+        type != "news"
+      ),
+      "other",
+      type,
+    ),
+    statistics.likeCount = if_else(is.na(statistics.likeCount), 0, as.double(statistics.likeCount)),
+    type = factor(type, levels = c("party", "news", "other")),
+  ) %>% 
+  # filter(type != "other") %>% 
+  filter(statistics.viewCount <= 3e6) %>% 
+  group_by(source.term, type, id.videoId) %>%
+  summarise(
+    statistics.likeCount = mean(statistics.likeCount, na.rm = T)
+  ) %>% 
+  group_by(source.term, type) %>% 
+  summarise(
+    statistics.likeCount = sum(statistics.likeCount)
+  ) %>% 
+  ungroup() %>%
+  mutate(
+    source.term = forcats::fct_reorder(source.term, statistics.likeCount, .desc = T, .fun = sum)
+  ) %T>%
+  show() %>% 
+  ggplot(aes(source.term, statistics.likeCount, fill = type)) +
+  geom_bar(
+    stat = "identity",
+    alpha = .75
+    ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    x = "",
+    y = "like count",
+    fill = ""
+  ) +
+  scale_fill_manual(
+      values = c(
+        "party" = "orangered1",
+        "news" = "lightskyblue1",
+        "other" = "grey90"
+      )
+  ) +
+  # scale_fill_manual(values = c("other" = "grey", "news" = "burlywood3", "party" = "darkseagreen3")) +
+  scale_y_continuous(
+    # minor_breaks = 1:15 * 1e6,
+    # breaks = 0:3 * 5e6,
+    # labels = scales::number_format(big.mark = ",")
+  )
+
+# ggsave(
+#   "../plots/like-count.png",
+#   plot = cummulative_like_count_plot,
+#   width = 5.5,
+#   height = 4,
+# )
+
+cummulative_like_count_plot
+```
+
+```{r}
+  filter(
+        search2,
+        between(
+          scrapedAt,
+          as.POSIXct("2019-08-01"),
+          as.POSIXct("2019-11-30")
+        )
+      ) %>%
+  ungroup %>%
+  left_join(
+    channels_coded_v3,
+    by = c("snippet.channelTitle" = "channel")
+  ) %>%
+  left_join(
+    candidates,
+    by = c("source.term" = "name")
+  ) %>%
+  mutate(
+    source.term = as.factor(paste0(
+      # source.term,
+      # ", ",
+      party
+    )),
+    type = if_else(
+      is.na(type) |
+      (
+        type != "party" &
+        type != "news"
+      ),
+      "other",
+      type
+    ),
+    type = factor(type, levels = c("party", "news", "other"))
+  ) %>%
+  filter(
+    statistics.viewCount <= 3e6 &
+    party != "FP"
+  ) %>%
+  group_by(source.term, type, id.videoId) %>%
+  summarise_at(
+    vars(starts_with("statistics")),
+    ~mean(., na.rm = T)
+  ) %>% 
+  group_by(source.term, type) %>% 
+  summarise_if(
+    is.numeric,
+    ~sum(., na.rm = T)
+    # statistics.viewCount = sum(statistics.viewCount)
+  ) %>% 
+  ungroup() %>%
+  mutate(
+    source.term = forcats::fct_reorder(source.term, statistics.viewCount, .desc = T, .fun = sum)
+  ) %>%
+  rename_at(vars(starts_with("statistics.")), ~stringr::str_remove(., "statistics.")) %>% 
+  select(
+    source.term,
+    type,
+    # ends_with("Count")
+    viewCount,
+    commentCount
+  ) %>% 
+  tidyr::pivot_longer(
+    ends_with("Count"),
+    names_to = "metric",
+    values_to = "value"
+  ) %>% 
+  ggplot(aes(source.term, value, fill = type)) +
+  geom_bar(
+    stat = "identity",
+    alpha = 0.75
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    x = "",
+    y = "",
+    fill = ""
+  ) +
+  scale_fill_manual(
+      values = c(
+        "party" = "orangered1",
+        "news" = "lightskyblue1",
+        "other" = "grey90"
+      )
+  ) +
+  facet_wrap(
+    . ~ metric,
+    scales = "free_y",
+    ncol = 1
+  ) +
+  scale_y_continuous(
+    # minor_breaks = 1:15 * 1e6,
+    # breaks = 0:3 * 5e6,
+    labels = scales::number_format(big.mark = ",")
+  )
+# +
+#   # scale_fill_manual(values = c("other" = "grey", "news" = "burlywood3", "party" = "darkseagreen3")) +
+
+```
+
+
+```{r}
+# source("../scripts/rankFlow.r")
+
+plot.rankFlow <- function(data, value, d) {
+  data %>%
+    filter(
+      source.term == value
+    ) %>% 
+    group_by(scrapedAt) %>% 
+    arrange(
+      -desc(running)
+    ) %>% 
+    do(head(., d)) %>% 
+    ungroup() %>% 
+    transmute(
+      id = as.factor(id.videoId),
+      # scrapedAt = as.factor(format(scrapedAt, format = "%D %H:%M")),
+      scrapedAt,
+      type,
+      viewCount = statistics.viewCount,
+      rank = as.factor(running),
+      source.term
+    ) %>% ggplot(
+      aes(
+        x = scrapedAt,
+        stratum = rank,
+        alluvium = id,
+        fill = type,
+        y = viewCount,
+        label = rank
+      )
+    ) +
+    geom_alluvium(show.legend = T) +
+    # geom_stratum(show.legend = F) +
+    # geom_vline(xintercept = 13, colour = "tomato2") +
+    scale_fill_viridis_d() +
+    # scale_y_continuous(limits = c(0, 2e6)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "", y ="view count")
+}
+
+rankplots2 <- search %>%
+  distinct(source.term) %>%
+  mutate(
+    plot = furrr::future_map(
+      source.term,
+      ~plot.rankFlow(
+        mutate(
+          left_join(search, channels_coded_v1, by =c("snippet.channelTitle" = "name")),
+          statistics.viewCount = if_else(is.na(statistics.viewCount), 0L, statistics.viewCount)
+        ),
+    .x,
+    d = 50)
+  )
+)
+dirs <- "../plots/rankFlow-2020-02-05-1/"
+dir.create(dirs, recursive = T)
+
+rankplots %>%
+  mutate(
+    map2(
+      plot,
+      source.term,
+      ~ggsave(plot = .x + labs(title = paste(.y)),  filename = paste0(dirs, .y, ".png"), device = "png", width = 7, height = 3.5))
+  )
+
+
+
+```
+
+```{r}
+plot.rankFlow(
+  mutate(
+    left_join(
+      search,
+      # filter(search, between(scrapedAt, as.POSIXct("2019-08-01"), as.POSIXct("2019-09-15"))),
+      channels_coded_v1, by = c("snippet.channelTitle" = "name")
+    ),
+    type = case_when(
+      !(type %in% c("news", "party")) ~ "other",
+      T ~ type
+    ),
+    statistics.viewCount = if_else(is.na(statistics.viewCount), 0L, statistics.viewCount)
+  ),
+  "Bodo Ramelow",
+  d = 50
+) +
+geom_vline(
+  xintercept = as.POSIXct("2019-09-01")
+)
+```
+
+```{r}
+mutate(
+    left_join(
+      filter(
+        search2,
+        between(
+          scrapedAt,
+          as.POSIXct("2019-08-01"),
+          as.POSIXct("2019-11-30")
+        )
+      ),
+      # filter(search, between(scrapedAt, as.POSIXct("2019-08-01"), as.POSIXct("2019-09-15"))),
+      channels_coded_v3, by = c("snippet.channelTitle" = "channel")
+    ),
+    type = case_when(
+      !(type %in% c("news", "party")) ~ "other",
+      T ~ type
+    ),
+    statistics.viewCount = if_else(is.na(statistics.viewCount), 0L, statistics.viewCount)
+  ) %>%
+    filter(
+      source.term %in% c(
+        "Björn Höcke",
+        "Bodo Ramelow"
+        # "Andreas Kalbitz",
+        # "Dietmar Woidke"
+      )
+    ) %>% 
+    group_by(scrapedAt) %>% 
+    arrange(
+      -desc(running)
+    ) %>% 
+    do(head(., 20)) %>% 
+    ungroup() %>% 
+    transmute(
+      id = as.factor(id.videoId),
+      # scrapedAt = as.factor(format(scrapedAt, format = "%D %H:%M")),
+      scrapedAt,
+      type,
+      viewCount = statistics.viewCount,
+      rank = as.factor(running),
+      source.term = as.factor(source.term)
+    ) %>%
+  # show() %>%
+  ggplot(
+      aes(
+        x = scrapedAt,
+        stratum = rank,
+        alluvium = id,
+        fill = type,
+        colour = type,
+        y = viewCount,
+        label = rank
+      ),
+      colour = "black"
+    ) +
+    geom_alluvium(
+      show.legend = T
+    ) +
+    geom_vline(
+      xintercept = as.POSIXct("2019-10-28"),
+      colour = "black",
+      linetype = "dashed"
+    ) +
+    scale_fill_manual(
+      values = c(
+        "party" = "orangered1",
+        "news" = "lightskyblue1",
+        "other" = "grey90"
+      )
+    ) + 
+    scale_color_manual(
+      values = c(
+        "other" = "grey50",
+        "news" = "lightskyblue4",
+        "party"  = "orangered4"
+      )
+    ) +
+    scale_x_datetime(
+      date_breaks = "week",
+      date_minor_breaks = "day",
+      date_labels = "%d.%m."
+    ) +
+    scale_y_continuous(
+      labels = scales::number_format(big.mark = ",")
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      x = "",
+      y ="viewCount",
+      fill = "",
+      colour = ""
+    ) +
+    facet_wrap(
+      . ~ source.term,
+      nrow = 2,
+      scales = "free_y"
+    )
+  
+```
+
+
