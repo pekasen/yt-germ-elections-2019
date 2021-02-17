@@ -1,2 +1,5 @@
 # yt-germ-elections-2019
 R and latex sources for our paper in Computation + Journalism 2020
+
+## Abstract
+YouTube has emerged as one of the most commonly used platforms for entertainment, information and political communication, for media consumers as well as professional communicators. News organizations and political parties alike have adopted strategies for publishing video content–ranging from already broadcasted news programs to political speeches of local party members. In this ongoing study we interrogate YouTube ranking algorithm on the occasions of three federal state elections in Germany. We retrieved ranked search results for every parties leading candidate in the elections, as well as the comments and replies which YouTube determines as relevant for each video occurring in the rankings. Preliminary results show that content dealing with and content authored by far-right parties is most widely consumed and interacted with. The ranking of the content is relatively stable over time but partially interrupted by short phases that jumble the previous order.
